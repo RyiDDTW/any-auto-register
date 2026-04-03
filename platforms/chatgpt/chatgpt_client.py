@@ -800,9 +800,24 @@ class ChatGPTClient:
                 self._log(f"账号创建成功 {describe_flow_state(next_state)}")
                 return (True, next_state) if return_state else (True, "账号创建成功")
             else:
+                error_code = ""
                 error_msg = r.text[:200]
-                self._log(f"创建失败: {r.status_code} - {error_msg}")
-                return False, f"HTTP {r.status_code}"
+                try:
+                    error_data = r.json() or {}
+                    error_info = error_data.get("error") or {}
+                    error_code = str(error_info.get("code") or "").strip()
+                    error_msg = str(error_info.get("message") or error_msg).strip()
+                except Exception:
+                    pass
+
+                detail = f"HTTP {r.status_code}"
+                if error_code:
+                    detail += f": {error_code}"
+                elif error_msg:
+                    detail += f": {error_msg}"
+
+                self._log(f"创建失败: {detail} - {error_msg[:200]}")
+                return False, detail
 
         except Exception as e:
             self._log(f"创建异常: {e}")

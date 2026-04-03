@@ -52,6 +52,8 @@ class OAuthClient:
         self.verbose = verbose
         self.browser_mode = browser_mode or "protocol"
         self.last_error = ""
+        self.last_workspace_id = ""
+        self.last_state = FlowState()
 
         # 创建 session
         self.session = curl_requests.Session()
@@ -481,6 +483,7 @@ class OAuthClient:
         impersonate=None,
         authorize_url=None,
         authorize_params=None,
+        screen_hint=None,
     ):
         """提交邮箱，获取 OAuth 流程的第一页状态。"""
         self._log("步骤2: POST /api/accounts/authorize/continue")
@@ -514,6 +517,8 @@ class OAuthClient:
         )
         headers.update(generate_datadog_trace())
         payload = {"username": {"kind": "email", "value": email}}
+        if screen_hint:
+            payload["screen_hint"] = str(screen_hint).strip()
 
         try:
             kwargs = {
@@ -648,6 +653,70 @@ class OAuthClient:
             self._set_error(f"密码验证异常: {e}")
             return None
 
+    def _send_passwordless_login_otp(
+        self,
+        email,
+        device_id,
+        *,
+        user_agent=None,
+        sec_ch_ua=None,
+        impersonate=None,
+        referer=None,
+    ):
+        """在 login_password 状态下直接切到 passwordless OTP。"""
+        self._log("步骤3: 命中 login_password，按新链路直接触发 passwordless OTP")
+
+        request_url = f"{self.oauth_issuer}/api/accounts/passwordless/send-otp"
+        headers = self._headers(
+            request_url,
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            accept="application/json",
+            referer=referer or f"{self.oauth_issuer}/log-in/password",
+            origin=self.oauth_issuer,
+            content_type="application/json",
+            fetch_site="same-origin",
+            extra_headers={
+                "oai-device-id": device_id,
+            },
+        )
+        headers.update(generate_datadog_trace())
+
+        try:
+            kwargs = {
+                "json": {"email": email},
+                "headers": headers,
+                "timeout": 30,
+                "allow_redirects": False,
+            }
+            if impersonate:
+                kwargs["impersonate"] = impersonate
+
+            self._browser_pause()
+            r = self.session.post(request_url, **kwargs)
+            self._log(f"/passwordless/send-otp -> {r.status_code}")
+
+            if r.status_code != 200:
+                self._set_error(f"触发 passwordless OTP 失败: {r.status_code} - {r.text[:180]}")
+                return None
+
+            try:
+                data = r.json()
+            except Exception:
+                data = {}
+
+            flow_state = self._state_from_payload(
+                data,
+                current_url=str(r.url) or f"{self.oauth_issuer}/email-verification",
+            )
+            if not self._state_is_email_otp(flow_state):
+                flow_state = self._state_from_url(f"{self.oauth_issuer}/email-verification")
+            self._log(f"passwordless OTP 已触发 {describe_flow_state(flow_state)}")
+            return flow_state
+        except Exception as e:
+            self._set_error(f"触发 passwordless OTP 异常: {e}")
+            return None
+
     def login_and_get_tokens(
         self,
         email,
@@ -657,6 +726,9 @@ class OAuthClient:
         sec_ch_ua=None,
         impersonate=None,
         skymail_client=None,
+        prefer_passwordless_login=False,
+        allow_phone_verification=True,
+        login_source="",
     ):
         """
         完整的 OAuth 登录流程，获取 tokens
@@ -669,12 +741,20 @@ class OAuthClient:
             sec_ch_ua: sec-ch-ua header
             impersonate: curl_cffi impersonate 参数
             skymail_client: Skymail 客户端（用于获取 OTP，如果需要）
+            prefer_passwordless_login: 是否强制走 passwordless OTP 链路
+            allow_phone_verification: add_phone 后是否允许进入手机号验证码分支
+            login_source: 当前登录场景，仅用于日志
 
         Returns:
             dict: tokens 字典，包含 access_token, refresh_token, id_token
         """
         self.last_error = ""
-        self._log("开始 OAuth 登录流程...")
+        self.last_workspace_id = ""
+        self.last_state = FlowState()
+        self._log(
+            "开始 OAuth 登录流程..."
+            + (f" (source={login_source})" if login_source else "")
+        )
 
         code_verifier, code_challenge = generate_pkce()
         oauth_state = secrets.token_urlsafe(32)
@@ -719,6 +799,7 @@ class OAuthClient:
             impersonate=impersonate,
             authorize_url=authorize_url,
             authorize_params=authorize_params,
+            screen_hint="login",
         )
         if not state:
             if not self.last_error:
@@ -730,6 +811,7 @@ class OAuthClient:
         referer = continue_referer
 
         for step in range(20):
+            self.last_state = state
             signature = self._state_signature(state)
             seen_states[signature] = seen_states.get(signature, 0) + 1
             if seen_states[signature] > 2:
@@ -749,6 +831,23 @@ class OAuthClient:
                     self._log("换取 tokens 失败")
                 return tokens
 
+            if prefer_passwordless_login and self._state_is_login_password(state):
+                next_state = self._send_passwordless_login_otp(
+                    email,
+                    device_id,
+                    user_agent=user_agent,
+                    sec_ch_ua=sec_ch_ua,
+                    impersonate=impersonate,
+                    referer=state.current_url or state.continue_url or referer,
+                )
+                if not next_state:
+                    if not self.last_error:
+                        self._set_error("passwordless OTP 触发后未进入邮箱验证码状态")
+                    return None
+                referer = state.current_url or referer
+                state = next_state
+                continue
+
             if self._state_is_login_password(state):
                 next_state = self._submit_password_verify(
                     password,
@@ -762,6 +861,33 @@ class OAuthClient:
                     if not self.last_error:
                         self._set_error("密码验证后未进入下一步 OAuth 状态")
                     return None
+                referer = state.current_url or referer
+                state = next_state
+                continue
+
+            if (
+                prefer_passwordless_login
+                and self._state_is_add_phone(state)
+                and self._state_requires_navigation(state)
+            ):
+                self._log("步骤5: OTP 后命中 add_phone，先实际访问 continue_url 争取重签 workspace Cookie")
+                code, next_state = self._follow_flow_state(
+                    state,
+                    referer=referer,
+                    user_agent=user_agent,
+                    impersonate=impersonate,
+                )
+                if code:
+                    self._log(f"获取到 authorization code: {code[:20]}...")
+                    self._log("步骤7: POST /oauth/token")
+                    tokens = self._exchange_code_for_tokens(
+                        code, code_verifier, user_agent, impersonate
+                    )
+                    if tokens:
+                        self._log("✅ OAuth 登录成功")
+                    else:
+                        self._log("换取 tokens 失败")
+                    return tokens
                 referer = state.current_url or referer
                 state = next_state
                 continue
@@ -788,6 +914,11 @@ class OAuthClient:
                 continue
 
             if self._state_is_add_phone(state):
+                if not allow_phone_verification:
+                    self._set_error(
+                        "passwordless 登录后仍停留在 add_phone，未获取到 workspace / callback"
+                    )
+                    return None
                 next_state = self._handle_add_phone_verification(
                     device_id,
                     user_agent,
@@ -921,6 +1052,7 @@ class OAuthClient:
             self._set_error("workspace_id 为空")
             return None, None
 
+        self.last_workspace_id = str(workspace_id).strip()
         self._log(f"选择 workspace: {workspace_id}")
 
         headers = self._headers(
